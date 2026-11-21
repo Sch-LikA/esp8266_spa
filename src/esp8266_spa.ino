@@ -7,38 +7,41 @@
 
 // TODO:
 // HomeAssistant autodiscover - DONE
-// Configuration handling -> DONE
+// Wi-Fi, MQTT, and OTA configuration through ignored secrets.h -> DONE
+// Password-protected Wi-Fi firmware updates -> DONE
+// Temperature setting with unit/range validation and confirmation -> DONE
 // Proper states (rather than just ON/OFF) -> NOT SURE HOW TO SOLVE THIS
-// OTA update from Firebase -> TO DO
-// ARDUINOOTA -> DOESN'T WORK YET -> SOMETHING WRONG WITH MDNS
+// Pumps 3-6, light 2, mister, and auxiliary devices -> TO DO
+// Clock, preferences, lock state, reminders, and filter-cycle writes -> TO DO
 // STA Mode to configure wifi -> WIP
 
 // +12V RED
 // GND  BLACK
 // A    YELLOW
 // B    WHITE
-#include <LittleFS.h>
-#include <ArduinoJson.h>
+#if __has_include(<secrets.h>)
+#include <secrets.h>
+#else
+#error "Copy include/secrets.h.example to include/secrets.h and configure your secrets."
+#endif
 #include <ESP8266WiFi.h>
-#include <CircularBuffer.h>
-#include <ESP8266WebServer.h>   // Local WebServer used to serve the configuration portal
+#include <CircularBuffer.hpp>
 #include <ESP8266mDNS.h>
-#include <ESP8266HTTPUpdateServer.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
-#include <ESP8266httpUpdate.h>
 
-
-
-#define VERSION "0.37.4"
-String NEXTVERSION = "http://github.com/EmmanuelLM/esp8266_spa/blob/master/firmware.0.37.5.bin";
-String WIFI_SSID = "beanwifi";
-String WIFI_PASSWORD = "RosieAndElisaBean1";
-String BROKER = "192.168.8.126";
-String BROKER_LOGIN = "mqtt";
-String BROKER_PASS = "13Cambridge!";
+#define VERSION "0.38.2"
+#define OTA_HOSTNAME "spa"
+#define DEBUG_BAUD 115200
+#define SPA_RESTART_REASON_MAGIC 0x53504121
+#define RESTART_REASON_NONE 0
+#define RESTART_REASON_RS485_TIMEOUT 1
+String WIFI_SSID = SPA_WIFI_SSID;
+String WIFI_PASSWORD = SPA_WIFI_PASSWORD;
+String BROKER = SPA_BROKER;
+String BROKER_LOGIN = SPA_BROKER_LOGIN;
+String BROKER_PASS = SPA_BROKER_PASS;
 #define AUTO_TX true //if your chip needs to pull D1 high/low set this to false
-#define SAVE_CONN true //save the ip details above to local filesystem
 
 #define STRON String("ON").c_str()
 #define STROFF String("OFF").c_str()
@@ -55,10 +58,10 @@ String BROKER_PASS = "13Cambridge!";
 CircularBuffer<uint8_t, 35> Q_in;
 CircularBuffer<uint8_t, 35> Q_out;
 
-ESP8266WebServer httpServer(80);
-ESP8266HTTPUpdateServer httpUpdater;
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
+bool otaInProgress = false;
+bool haveTemperatureScale = false;
 
 extern uint8_t crc8();
 extern void ID_request();
@@ -68,15 +71,23 @@ uint8_t x, i, j;
 uint8_t last_state_crc = 0x00;
 uint8_t send = 0x00;
 uint8_t settemp = 0x00;
+uint8_t requestedSetTemperature = 0xFF;
+unsigned long temperatureRequestAt = 0;
 uint8_t id = 0x00;
 unsigned long lastrx = 0;
+bool receivedSpaPacket = false;
+unsigned long lastHealthLog = 0;
 char have_config = 0; //stages: 0-> want it; 1-> requested it; 2-> got it; 3-> further processed it
 char have_faultlog = 0; //stages: 0-> want it; 1-> requested it; 2-> got it; 3-> further processed it
 char have_filtersettings = 0; //stages: 0-> want it; 1-> requested it; 2-> got it; 3-> further processed it
-char ip_settings = 0; //stages: 0-> want it; 1-> requested it; 2-> got it; 3-> further processed it
-char wifi_settings = 0; //stages: 0-> want it; 1-> requested it; 2-> got it; 3-> further processed it
 char faultlog_minutes = 0; //temp logic so we only get the fault log once per 5 minutes
 char filtersettings_minutes = 0; //temp logic so we only get the filter settings once per 5 minutes
+String restartReason;
+
+struct {
+  uint32_t magic;
+  uint32_t reason;
+} ResetState;
 
 struct {
   uint8_t jet1 :2;
@@ -132,10 +143,9 @@ struct {
 
 void _yield() {
   yield();
-  mqtt.loop();
-  httpServer.handleClient();
-  MDNS.update();
   ArduinoOTA.handle();
+  MDNS.update();
+  if (!otaInProgress) mqtt.loop();
 }
 
 void print_msg(CircularBuffer<uint8_t, 35> &data) {
@@ -304,7 +314,6 @@ void decodeSettings() {
   SpaConfig.mister = ((Q_in[9] & 0x30) != 0);
   SpaConfig.aux1 = ((Q_in[9] & 0x01) != 0);
   SpaConfig.aux2 = ((Q_in[9] & 0x02) != 0);
-  SpaConfig.temp_scale = Q_in[3] & 0x01; //Read temperature scale - 0 -> Farenheit, 1-> Celcius
   mqtt.publish("Spa/config/pumps1", String(SpaConfig.pump1).c_str());
   mqtt.publish("Spa/config/pumps2", String(SpaConfig.pump2).c_str());
   mqtt.publish("Spa/config/pumps3", String(SpaConfig.pump3).c_str());
@@ -318,7 +327,6 @@ void decodeSettings() {
   mqtt.publish("Spa/config/mister", String(SpaConfig.mister).c_str());
   mqtt.publish("Spa/config/aux1", String(SpaConfig.aux1).c_str());
   mqtt.publish("Spa/config/aux2", String(SpaConfig.aux2).c_str());
-  mqtt.publish("Spa/config/temp_scale", String(SpaConfig.temp_scale).c_str());
   have_config = 2;
 }
 
@@ -330,23 +338,36 @@ void decodeState() {
   // DEBUG for finding meaning:
   //print_msg(Q_in);
 
+  // Status flags byte 9 contains the active temperature scale:
+  // 0 = whole Fahrenheit degrees, 1 = half Celsius degrees.
+  SpaConfig.temp_scale = bitRead(Q_in[14], 0);
+  haveTemperatureScale = true;
+  mqtt.publish("Spa/config/temp_scale", String(SpaConfig.temp_scale).c_str());
+
   // 25:Flag Byte 20 - Set Temperature
   if (SpaConfig.temp_scale == 0) {
     d = Q_in[25];
-  } else if (SpaConfig.temp_scale == 1){
-    d = Q_in[25] / 2;
-    if (Q_in[25] % 2 == 1) d += 0.5;
+  } else {
+    d = Q_in[25] / 2.0;
   }
 
   mqtt.publish("Spa/target_temp/state", String(d, 2).c_str());
+  if (requestedSetTemperature != 0xFF && Q_in[25] == requestedSetTemperature) {
+    Serial1.printf(
+      "[temp] Confirmed target %.1f %s\n",
+      d,
+      SpaConfig.temp_scale ? "C" : "F"
+    );
+    mqtt.publish("Spa/target_temp/result", "ok");
+    requestedSetTemperature = 0xFF;
+  }
 
   // 7:Flag Byte 2 - Actual temperature
   if (Q_in[7] != 0xFF) {
     if (SpaConfig.temp_scale == 0) {
       d = Q_in[7];
-    } else if (SpaConfig.temp_scale == 1){
-      d = Q_in[7] / 2;
-      if (Q_in[7] % 2 == 1) d += 0.5;
+    } else {
+      d = Q_in[7] / 2.0;
     }
 
     if (c > 0) {
@@ -452,8 +473,30 @@ void decodeState() {
 ///////////////////////////////////////////////////////////////////////////////
 
 void hardreset() {
-  ESP.wdtDisable();
-  while (1) {};
+  if (otaInProgress) return;
+  Serial1.println("[spa] Restarting after fatal condition");
+  Serial1.flush();
+  delay(100);
+  ESP.restart();
+}
+
+void prepareRestart(uint32_t reason) {
+  ResetState.magic = SPA_RESTART_REASON_MAGIC;
+  ResetState.reason = reason;
+  ESP.rtcUserMemoryWrite(0, reinterpret_cast<uint32_t *>(&ResetState), sizeof(ResetState));
+  hardreset();
+}
+
+String loadRestartReason() {
+  if (ESP.rtcUserMemoryRead(0, reinterpret_cast<uint32_t *>(&ResetState), sizeof(ResetState)) &&
+      ResetState.magic == SPA_RESTART_REASON_MAGIC) {
+    const uint32_t reason = ResetState.reason;
+    ResetState.reason = RESTART_REASON_NONE;
+    ESP.rtcUserMemoryWrite(0, reinterpret_cast<uint32_t *>(&ResetState), sizeof(ResetState));
+    if (reason == RESTART_REASON_RS485_TIMEOUT) return "rs485_timeout";
+    if (reason == RESTART_REASON_NONE) return "software_restart";
+  }
+  return ESP.getResetReason();
 }
 
 void mqttpubsub() {
@@ -474,9 +517,9 @@ void mqttpubsub() {
       mqtt.publish("homeassistant/binary_sensor/Spa/state/config", Payload.c_str(), true);
       //climate temperature
       if (SpaConfig.temp_scale == 0) {
-        mqtt.publish("homeassistant/climate/Spa/temperature/config", "{\"name\":\"Hot tub thermostat\",\"uniq_id\":\"ESP82Spa_0\",\"temp_cmd_t\":\"Spa/target_temp/set\",\"mode_cmd_t\":\"Spa/heat_mode/set\",\"mode_stat_t\":\"Spa/heat_mode/state\",\"temp_unit\": \"F\",\"curr_temp_t\":\"Spa/temperature/state\",\"temp_stat_t\":\"Spa/target_temp/state\",\"min_temp\":\"80\",\"max_temp\":\"105\",\"modes\":[\"off\", \"heat\"], \"temp_step\":\"1\",\"platform\":\"mqtt\",\"dev\":{\"ids\":[\"ESP82Spa\"]}}", true);
+        mqtt.publish("homeassistant/climate/Spa/temperature/config", "{\"name\":\"Hot tub thermostat\",\"uniq_id\":\"ESP82Spa_0\",\"temp_cmd_t\":\"Spa/target_temp/set\",\"mode_cmd_t\":\"Spa/heat_mode/set\",\"mode_stat_t\":\"Spa/heat_mode/state\",\"temp_unit\":\"F\",\"curr_temp_t\":\"Spa/temperature/state\",\"temp_stat_t\":\"Spa/target_temp/state\",\"min_temp\":\"50\",\"max_temp\":\"104\",\"modes\":[\"off\", \"heat\"], \"temp_step\":\"1\",\"platform\":\"mqtt\",\"dev\":{\"ids\":[\"ESP82Spa\"]}}", true);
       } else if (SpaConfig.temp_scale == 1) {
-        mqtt.publish("homeassistant/climate/Spa/temperature/config", "{\"name\":\"Hot tub thermostat\",\"uniq_id\":\"ESP82Spa_0\",\"temp_cmd_t\":\"Spa/target_temp/set\",\"mode_cmd_t\":\"Spa/heat_mode/set\",\"mode_stat_t\":\"Spa/heat_mode/state\",\"temp_unit\": \"C\",\"curr_temp_t\":\"Spa/temperature/state\",\"temp_stat_t\":\"Spa/target_temp/state\",\"min_temp\":\"27\",\"max_temp\":\"40\",\"modes\":[\"off\", \"heat\"], \"temp_step\":\"0.5\",\"platform\":\"mqtt\",\"dev\":{\"ids\":[\"ESP82Spa\"]}}", true);
+        mqtt.publish("homeassistant/climate/Spa/temperature/config", "{\"name\":\"Hot tub thermostat\",\"uniq_id\":\"ESP82Spa_0\",\"temp_cmd_t\":\"Spa/target_temp/set\",\"mode_cmd_t\":\"Spa/heat_mode/set\",\"mode_stat_t\":\"Spa/heat_mode/state\",\"temp_unit\":\"C\",\"curr_temp_t\":\"Spa/temperature/state\",\"temp_stat_t\":\"Spa/target_temp/state\",\"min_temp\":\"10\",\"max_temp\":\"40\",\"modes\":[\"off\", \"heat\"], \"temp_step\":\"0.5\",\"platform\":\"mqtt\",\"dev\":{\"ids\":[\"ESP82Spa\"]}}", true);
       }
       //heat mode
       mqtt.publish("homeassistant/switch/Spa/heatingmode/config", "{\"name\":\"Hot tub heating mode\",\"uniq_id\":\"ESP82Spa_3\",\"cmd_t\":\"Spa/heatingmode/set\",\"stat_t\":\"Spa/heatingmode/state\",\"platform\":\"mqtt\",\"dev\":{\"ids\":[\"ESP82Spa\"]}}", true);
@@ -523,6 +566,7 @@ void mqttpubsub() {
   mqtt.publish("Spa/node/flashsize", String(ESP.getFlashChipRealSize()).c_str());
   mqtt.publish("Spa/node/chipid", String(ESP.getChipId()).c_str());
 	mqtt.publish("Spa/node/speed", String(ESP.getCpuFreqMHz()).c_str());
+	mqtt.publish("Spa/node/reset_reason", restartReason.c_str(), true);
 
   // ... and resubscribe
   mqtt.subscribe("Spa/command");
@@ -561,6 +605,7 @@ void reconnect() {
   // Loop until we're reconnected
   if (!mqtt.connected()) {
     // Attempt to connect
+    Serial1.printf("[mqtt] Connecting to %s:1883...\n", BROKER.c_str());
     if (BROKER_PASS == "") {
       //connection =
       mqtt.connect(String(String("Spa") + String(millis())).c_str());
@@ -568,6 +613,13 @@ void reconnect() {
     else {
       //connection =
       mqtt.connect(String(String("Spa") + String(millis())).c_str(), BROKER_LOGIN.c_str(), BROKER_PASS.c_str());
+    }
+    if (mqtt.connected()) {
+      Serial1.println("[mqtt] Connected");
+      mqtt.publish("Spa/node/reset_reason", restartReason.c_str(), true);
+      mqtt.publish("Spa/node/version", VERSION, true);
+    } else {
+      Serial1.printf("[mqtt] Connection failed, state %d\n", mqtt.state());
     }
     //time to connect
     delay(1000);
@@ -637,110 +689,42 @@ void callback(char* p_topic, byte * p_payload, unsigned int p_length) {
     if (payload.equals("ON") && SpaState.highrange == 0) send = 0x50; //ON = High, OFF = Low
     else if (payload.equals("OFF") && SpaState.highrange == 1) send = 0x50;
   } else if (topic.equals("Spa/target_temp/set")) {
-    // Get new set temperature
-    double d = payload.toDouble();
-    if (d > 0) d *= 2; // Convert to internal representation
-    settemp = d;
+    Serial1.printf("[temp] Target request: %s\n", payload.c_str());
+    double requestedTemperature = payload.toDouble();
+    double minimum = SpaState.highrange ? (SpaConfig.temp_scale ? 26.0 : 80.0)
+                                        : (SpaConfig.temp_scale ? 10.0 : 50.0);
+    double maximum = SpaState.highrange ? (SpaConfig.temp_scale ? 40.0 : 104.0)
+                                        : (SpaConfig.temp_scale ? 26.0 : 80.0);
+
+    if (requestedTemperature < minimum || requestedTemperature > maximum) {
+      Serial1.printf(
+        "[temp] Rejected %.1f; active range %.1f-%.1f\n",
+        requestedTemperature,
+        minimum,
+        maximum
+      );
+      mqtt.publish(
+        "Spa/target_temp/result",
+        String(String("rejected: expected ") + String(minimum, 1) + "-" +
+               String(maximum, 1)).c_str()
+      );
+      return;
+    }
+
+    settemp = SpaConfig.temp_scale
+      ? lround(requestedTemperature * 2.0)
+      : lround(requestedTemperature);
+    requestedSetTemperature = settemp;
+    temperatureRequestAt = millis();
     send = 0xff;
+    mqtt.publish("Spa/target_temp/result", "queued");
+    Serial1.printf("[temp] Queued protocol value %u\n", settemp);
   }
 }
-
-/// UPDATE FILESYSTE
-void update_started() {
-  mqtt.publish("Spa/node/debug", "Updated started");
-}
-
-void update_finished() {
-  mqtt.publish("Spa/node/debug", "Updated finished");
-}
-
-void update_progress(int cur, int total) {
-  mqtt.publish("Spa/node/debug", "Update in progress");
-}
-
-void update_error(int err) {
-  mqtt.publish("Spa/node/debug", "Updated error");
-}
-
 
 ///////////////////////////////////////////////////////////////////////////////
 
 void setup() {
-  DynamicJsonDocument jsonSettings(1024);
-  //jsonSettings["WIFI_SSID"] = "";
-  //jsonSettings["WIFI_PASSWORD"] = "";
-  //jsonSettings["BROKER"] = "";
-  //jsonSettings["BROKER_LOGIN"] = "";
-  //jsonSettings["BROKER_PASS"] = "";
-
-  ArduinoOTA.begin();
-
-  String error_msg = "";
-
-  //if (LittleFS.format()){
-
-  if (LittleFS.begin()) {
-
-  if (SAVE_CONN == true) {
-    File f = LittleFS.open("/ip.txt", "w");
-    if (!f) {
-      error_msg = "failed to create file";
-    }
-
-    jsonSettings["WIFI_SSID"] = WIFI_SSID;
-    jsonSettings["WIFI_PASSWORD"] = WIFI_PASSWORD;
-    jsonSettings["BROKER"] = BROKER;
-    jsonSettings["BROKER_LOGIN"] = BROKER_LOGIN;
-    jsonSettings["BROKER_PASS"] = BROKER_PASS;
-
-    if (serializeJson(jsonSettings, f) == 0) {
-      error_msg = "failed to write file";
-    }
-
-    f.close();
-  }
-
-  jsonSettings["WIFI_SSID"] = "";
-  jsonSettings["WIFI_PASSWORD"] = "";
-  jsonSettings["BROKER"] = "";
-  jsonSettings["BROKER_LOGIN"] = "";
-  jsonSettings["BROKER_PASS"] = "";
-
-  if (ip_settings == 0) {
-    ip_settings = 1;
-    //read the settings from filesystem, if empty, put in AP mode
-
-    File file = LittleFS.open("/ip.txt", "r");
-    if (!file) {
-      error_msg = "could not open file for reading";
-      // STA LOGIC HERE
-      wifi_settings = 1;
-
-
-    } else {
-      deserializeJson(jsonSettings, file);
-      //Filesystem methods assuming it all went well
-
-      //now I have them - NOTE: PROBABLY NEED TO CHECK THEM!!!!!
-      ip_settings = 2;
-      WIFI_SSID = jsonSettings["WIFI_SSID"].as<String>();
-      WIFI_PASSWORD = jsonSettings["WIFI_PASSWORD"].as<String>();
-      BROKER = jsonSettings["BROKER"].as<String>();
-      BROKER_LOGIN = jsonSettings["BROKER_LOGIN"].as<String>();
-      BROKER_PASS = jsonSettings["BROKER_PASS"].as<String>();
-      error_msg = "Successfully read the configuration";
-    }
-    file.close();
-
-  }
-} else {
-  error_msg = "Could not mount fs";
-}
-
-  LittleFS.end();
-
-
-
   // Begin RS485 in listening mode -> no longer required with new RS485 chip
   if (AUTO_TX){
 
@@ -756,6 +740,16 @@ void setup() {
 
   // Spa communication, 115.200 baud 8N1
   Serial.begin(115200);
+  Serial1.begin(DEBUG_BAUD);
+  Serial1.println();
+  Serial1.printf("[boot] esp8266_spa %s starting\n", VERSION);
+  Serial1.printf(
+    "[boot] Chip %08X, reset reason: %s\n",
+    ESP.getChipId(),
+    ESP.getResetReason().c_str()
+  );
+  restartReason = loadRestartReason();
+  Serial1.printf("[boot] Published reset reason: %s\n", restartReason.c_str());
 
   // give Spa time to wake up after POST
   for (uint8_t i = 0; i < 5; i++) {
@@ -766,61 +760,75 @@ void setup() {
   Q_in.clear();
   Q_out.clear();
 
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(OTA_HOSTNAME);
   WiFi.setOutputPower(20.5); // this sets wifi to highest power
   WiFi.begin(WIFI_SSID.c_str(), WIFI_PASSWORD.c_str());
   unsigned long timeout = millis() + 10000;
 
   while (WiFi.status() != WL_CONNECTED && millis() < timeout) {
+    Serial1.print('.');
     yield();
+    delay(100);
   }
+  Serial1.println();
 
   // Reset because of no connection
   if (WiFi.status() != WL_CONNECTED) {
-    // STA LOGIC HERE
-    wifi_settings = 1;
-
-    // SAVE WIFI SETTINGS TO FILESYSTEM
+    Serial1.printf("[wifi] Connection failed, status %d\n", WiFi.status());
     hardreset();
   }
-
-  httpUpdater.setup(&httpServer, "admin", "");
-  httpServer.begin();
+  Serial1.printf(
+    "[wifi] Connected: IP %s, RSSI %d dBm, hostname %s.local\n",
+    WiFi.localIP().toString().c_str(),
+    WiFi.RSSI(),
+    OTA_HOSTNAME
+  );
 
   mqtt.setServer(BROKER.c_str(), 1883);
   mqtt.setCallback(callback);
   mqtt.setKeepAlive(10);
   mqtt.setSocketTimeout(20);
 
-  MDNS.begin("spa");
-  MDNS.addService("http", "tcp", 80);
-
-  /*the below is for debug purposes
-  mqtt.connect("Spa1", BROKER_LOGIN.c_str(), BROKER_PASS.c_str());
-  mqtt.publish("Spa/debug/wifi_ssid", WIFI_SSID.c_str());
-  mqtt.publish("Spa/debug/wifi_password", WIFI_PASSWORD.c_str());
-  mqtt.publish("Spa/debug/broker", BROKER.c_str());
-  mqtt.publish("Spa/debug/broker_login", BROKER_LOGIN.c_str());
-  mqtt.publish("Spa/debug/broker_pass", BROKER_PASS.c_str());
-  mqtt.publish("Spa/debug/error", error_msg.c_str());
-  */
-
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(SPA_OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    otaInProgress = true;
+    Serial1.println("[ota] Update started");
+    mqtt.publish("Spa/node/debug", "OTA update started");
+  });
+  ArduinoOTA.onEnd([]() {
+    otaInProgress = false;
+    Serial1.println("[ota] Update finished");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaInProgress = false;
+    Serial1.printf("[ota] Update error %u\n", error);
+    mqtt.publish("Spa/node/debug", String(String("OTA error: ") + error).c_str());
+  });
+  ArduinoOTA.begin();
+  Serial1.printf("[ota] Ready at %s.local:%u (password protected)\n", OTA_HOSTNAME, 8266);
+  lastrx = millis();
 }
 
 void loop() {
+  if (otaInProgress) {
+    _yield();
+    return;
+  }
   if (WiFi.status() != WL_CONNECTED) ESP.restart();
   if (!mqtt.connected()) reconnect();
-  if (have_config == 2) mqttpubsub(); //do mqtt stuff after we're connected and if we have got the config elements
-  //httpServer.handleClient(); needed?
+  if (have_config == 2 && haveTemperatureScale) mqttpubsub(); // publish MQTT discovery only after config and unit are known
   _yield();
 
-  /*
-  ESPhttpUpdate.onStart(update_started);
-  ESPhttpUpdate.onEnd(update_finished);
-  ESPhttpUpdate.onProgress(update_progress);
-  ESPhttpUpdate.onError(update_error);
-  */
+  if (requestedSetTemperature != 0xFF &&
+      millis() - temperatureRequestAt > 5000) {
+    Serial1.println("[temp] Target update was not confirmed");
+    mqtt.publish("Spa/target_temp/result", "not_confirmed");
+    requestedSetTemperature = 0xFF;
+  }
 
-  //Every x minutes, read the fault log and filter settings using SpaState,minutes, and check for updates
+  //Every x minutes, read the fault log and filter settings using SpaState.minutes
   if ((int)(SpaState.minutes % 5) == 0)
   {
     //logic to only get the error message once -> this is dirty
@@ -842,24 +850,6 @@ void loop() {
       }
     }
 
-    //perform binary updates
-    /*
-    WiFiClient wifiClient2;
-    t_httpUpdate_return ret = ESPhttpUpdate.update(wifiClient2, NEXTVERSION);
-    switch (ret) {
-      case HTTP_UPDATE_FAILED:
-        mqtt.publish("Spa/node/debug", "Update failed");
-        break;
-
-      case HTTP_UPDATE_NO_UPDATES:
-        mqtt.publish("Spa/node/debug", "No update");
-        break;
-
-      case HTTP_UPDATE_OK:
-        mqtt.publish("Spa/node/debug", "Update ok");
-        break;
-    }*/
-
   }
 
   // DEBUG:mqtt.publish("Spa/rcv", String(x).c_str()); _yield();
@@ -871,6 +861,10 @@ void loop() {
     // Drop until SOF is seen
     if (Q_in.first() != 0x7E) Q_in.clear();
     lastrx = millis();
+    if (!receivedSpaPacket) {
+      receivedSpaPacket = true;
+      Serial1.println("[rs485] Spa traffic received");
+    }
   }
 
   // Double SOF-marker, drop last one
@@ -889,6 +883,7 @@ void loop() {
       if (Q_in[2] == 0xFE && Q_in[4] == 0x02) {
         id = Q_in[5];
         if (id > 0x2F) id = 0x2F;
+        Serial1.printf("[rs485] Assigned client ID 0x%02X\n", id);
 
         ID_ack();
         mqtt.publish("Spa/node/id", String(id).c_str());
@@ -980,9 +975,22 @@ void loop() {
   }
 
   // Long time no receive
-  if (millis() - lastrx > 10000) {
+  if (!otaInProgress && millis() - lastrx > 30000) {
     if (PRODUCTION) {
-      hardreset();
+      Serial1.println("[rs485] No spa traffic for 30 seconds");
+      prepareRestart(RESTART_REASON_RS485_TIMEOUT);
     }
+  }
+
+  if (millis() - lastHealthLog > 30000) {
+    lastHealthLog = millis();
+    Serial1.printf(
+      "[health] WiFi RSSI %d dBm, MQTT %s, RS485 %s, client 0x%02X, free heap %u\n",
+      WiFi.RSSI(),
+      mqtt.connected() ? "connected" : "disconnected",
+      millis() - lastrx < 30000 ? "active" : "stale",
+      id,
+      ESP.getFreeHeap()
+    );
   }
 }
